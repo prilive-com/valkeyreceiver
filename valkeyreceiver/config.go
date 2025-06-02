@@ -56,6 +56,10 @@ type Config struct {
 	// Dead letter queue settings
 	DeadLetterQueue string `json:"dead_letter_queue,omitempty"`
 	
+	// Startup drain settings
+	ProcessExistingMessages bool          `json:"process_existing_messages"`
+	StartupDrainTimeout     time.Duration `json:"startup_drain_timeout"`
+	
 	// Logging
 	LogLevel string `json:"log_level"`
 }
@@ -109,6 +113,10 @@ func LoadConfig() (*Config, error) {
 		// Dead letter queue
 		DeadLetterQueue: os.Getenv("VALKEY_RECEIVER_DEAD_LETTER_QUEUE"),
 
+		// Startup drain defaults
+		ProcessExistingMessages: getEnvAsBoolOrDefault("VALKEY_RECEIVER_PROCESS_EXISTING_MESSAGES", true),
+		StartupDrainTimeout:     getEnvAsDurationOrDefault("VALKEY_RECEIVER_STARTUP_DRAIN_TIMEOUT", 30*time.Second),
+
 		// Logging defaults
 		LogLevel: getEnvOrDefault("VALKEY_RECEIVER_LOG_LEVEL", "INFO"),
 	}
@@ -148,6 +156,10 @@ func validateConfig(config *Config) error {
 
 	if len(config.DefaultQueues) == 0 {
 		return fmt.Errorf("VALKEY_RECEIVER_DEFAULT_QUEUES must not be empty")
+	}
+
+	if config.StartupDrainTimeout <= 0 {
+		return fmt.Errorf("VALKEY_RECEIVER_STARTUP_DRAIN_TIMEOUT must be greater than 0")
 	}
 
 	validLogLevels := map[string]bool{

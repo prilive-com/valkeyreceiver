@@ -223,6 +223,21 @@ func (c *consumer) Start(ctx context.Context) error {
 		c.logger.Info("Consumer stopped", "component", "valkeyreceiver")
 	}()
 
+	// Drain existing messages on startup if configured
+	if c.config.ProcessExistingMessages {
+		c.logger.Info("Processing existing messages from queues on startup",
+			"queues", c.getQueueNames(),
+			"timeout", c.config.StartupDrainTimeout,
+			"component", "valkeyreceiver")
+		
+		if err := c.drainExistingMessages(ctx); err != nil {
+			c.logger.Error("Failed to drain existing messages",
+				"error", err,
+				"component", "valkeyreceiver")
+			// Continue with normal operation even if drain fails
+		}
+	}
+
 	// Start message consumption loop
 	for {
 		select {
@@ -493,6 +508,186 @@ func (c *consumer) handleFailedMessage(ctx context.Context, queue string, messag
 			"final_error", err.Error(),
 			"component", "valkeyreceiver")
 	}
+}
+
+// drainExistingMessages processes all existing messages in subscribed queues on startup
+func (c *consumer) drainExistingMessages(ctx context.Context) error {
+	drainCtx, cancel := context.WithTimeout(ctx, c.config.StartupDrainTimeout)
+	defer cancel()
+
+	queues := c.getQueueNames()
+	if len(queues) == 0 {
+		c.logger.Info("No queues subscribed for startup drain", "component", "valkeyreceiver")
+		return nil
+	}
+
+	totalProcessed := 0
+	startTime := time.Now()
+
+	for _, queue := range queues {
+		queueKey := fmt.Sprintf("queue:%s", queue)
+		
+		// Get current queue size for logging
+		queueSize, err := c.client.LLen(drainCtx, queueKey).Result()
+		if err != nil {
+			c.logger.Warn("Failed to get queue size for drain",
+				"queue", queue,
+				"error", err,
+				"component", "valkeyreceiver")
+			continue
+		}
+
+		if queueSize == 0 {
+			c.logger.Debug("Queue is empty, skipping drain",
+				"queue", queue,
+				"component", "valkeyreceiver")
+			continue
+		}
+
+		c.logger.Info("Starting drain for queue",
+			"queue", queue,
+			"queue_size", queueSize,
+			"component", "valkeyreceiver")
+
+		queueProcessed := 0
+		
+		// Process all existing messages in this queue
+		for {
+			select {
+			case <-drainCtx.Done():
+				c.logger.Warn("Startup drain timeout reached",
+					"queue", queue,
+					"processed_this_queue", queueProcessed,
+					"total_processed", totalProcessed,
+					"elapsed", time.Since(startTime),
+					"component", "valkeyreceiver")
+				return drainCtx.Err()
+			default:
+				// Use RPOP (non-blocking) to get messages from the tail
+				messageData, err := c.client.RPop(drainCtx, queueKey).Result()
+				if err != nil {
+					if err == redis.Nil {
+						// Queue is empty, move to next queue
+						c.logger.Info("Queue drain completed",
+							"queue", queue,
+							"processed", queueProcessed,
+							"component", "valkeyreceiver")
+						break
+					}
+					c.logger.Error("Error during queue drain",
+						"queue", queue,
+						"error", err,
+						"component", "valkeyreceiver")
+					break
+				}
+
+				// Process the message synchronously during drain
+				if err := c.processDrainMessage(drainCtx, queue, messageData); err != nil {
+					c.logger.Error("Failed to process message during drain",
+						"queue", queue,
+						"error", err,
+						"component", "valkeyreceiver")
+					// Continue processing other messages even if one fails
+				}
+
+				queueProcessed++
+				totalProcessed++
+
+				// Log progress for large queues
+				if queueProcessed%100 == 0 {
+					c.logger.Info("Drain progress",
+						"queue", queue,
+						"processed", queueProcessed,
+						"total_processed", totalProcessed,
+						"elapsed", time.Since(startTime),
+						"component", "valkeyreceiver")
+				}
+			}
+		}
+	}
+
+	drainDuration := time.Since(startTime)
+	c.logger.Info("Startup drain completed",
+		"total_processed", totalProcessed,
+		"queues_processed", len(queues),
+		"duration", drainDuration,
+		"component", "valkeyreceiver")
+
+	return nil
+}
+
+// processDrainMessage handles individual message processing during startup drain
+func (c *consumer) processDrainMessage(ctx context.Context, queue string, messageData string) error {
+	// Get handler for the queue
+	c.subMutex.RLock()
+	handler, exists := c.subscriptions[queue]
+	c.subMutex.RUnlock()
+
+	if !exists {
+		c.logger.Warn("No handler for queue during drain, dropping message",
+			"queue", queue,
+			"component", "valkeyreceiver")
+		return nil
+	}
+
+	// Parse message envelope
+	var envelope MessageEnvelope
+	if err := json.Unmarshal([]byte(messageData), &envelope); err != nil {
+		c.logger.Error("Failed to unmarshal message envelope during drain",
+			"error", err,
+			"queue", queue,
+			"raw_data", messageData,
+			"component", "valkeyreceiver")
+		c.processingErrors.Add(1)
+		return fmt.Errorf("invalid message envelope: %w", err)
+	}
+
+	// Create message object
+	message := Message{
+		Queue:     queue,
+		Value:     []byte(messageData),
+		Headers:   envelope.Headers,
+		Timestamp: envelope.Timestamp,
+		MessageID: envelope.ID,
+		TTL:       envelope.TTL,
+		Retries:   envelope.Retries,
+	}
+
+	// Process message with handler (synchronously during drain)
+	c.messagesReceived.Add(1)
+	if err := handler.Handle(ctx, message); err != nil {
+		c.logger.Error("Message processing failed during drain",
+			"error", err,
+			"queue", queue,
+			"message_id", envelope.ID,
+			"retries", envelope.Retries,
+			"component", "valkeyreceiver")
+
+		c.processingErrors.Add(1)
+
+		// Call error handler if provided
+		if c.options.ErrorHandler != nil {
+			c.options.ErrorHandler(err)
+		}
+
+		// Handle retries and dead letter queue
+		c.handleFailedMessage(ctx, queue, messageData, envelope, err)
+		return err
+	}
+
+	// Success
+	c.messagesProcessed.Add(1)
+	c.logger.Debug("Message processed successfully during drain",
+		"queue", queue,
+		"message_id", envelope.ID,
+		"component", "valkeyreceiver")
+
+	// Call success handler if provided
+	if c.options.SuccessHandler != nil {
+		c.options.SuccessHandler(message)
+	}
+
+	return nil
 }
 
 // Stop gracefully stops the consumer
