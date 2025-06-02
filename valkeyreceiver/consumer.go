@@ -112,15 +112,26 @@ func NewConsumer(config *Config, options *ConsumerOptions) (Consumer, error) {
 
 	client := redis.NewClient(redisOptions)
 
-	// Create circuit breaker for resilience
+	// Create circuit breaker for resilience (only for Redis connection failures, not processing failures)
 	circuitBreakerSettings := gobreaker.Settings{
 		Name:        "valkeyreceiver",
 		MaxRequests: config.BreakerMaxRequests,
 		Interval:    config.BreakerInterval,
 		Timeout:     config.BreakerTimeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			// Only trip on consecutive Redis connection failures, not processing failures
+			// Require at least 5 requests and 80% failure rate to trip
 			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-			return counts.Requests >= 3 && failureRatio >= 0.6
+			shouldTrip := counts.Requests >= 5 && failureRatio >= 0.8
+			if shouldTrip {
+				logger.Warn("Circuit breaker tripping due to high failure rate",
+					"requests", counts.Requests,
+					"failures", counts.TotalFailures,
+					"consecutive_failures", counts.ConsecutiveFailures,
+					"failure_ratio", failureRatio,
+					"component", "valkeyreceiver")
+			}
+			return shouldTrip
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			logger.Info("Circuit breaker state changed",
@@ -297,15 +308,23 @@ func (c *consumer) consumeMessages(ctx context.Context) error {
 		}
 
 		// BRPOP with timeout for blocking consumption
-		return c.client.BRPop(ctx, c.config.BlockingTimeout, redisKeys...).Result()
+		brpopResult, brpopErr := c.client.BRPop(ctx, c.config.BlockingTimeout, redisKeys...).Result()
+		
+		// Handle redis.Nil (timeout/no messages) as success, not failure
+		if brpopErr == redis.Nil {
+			return nil, nil // Return success to circuit breaker, we'll handle nil result outside
+		}
+		
+		return brpopResult, brpopErr
 	})
 
 	if err != nil {
-		if err == redis.Nil {
-			// No messages available, this is normal
-			return nil
-		}
 		return fmt.Errorf("BRPOP failed: %w", err)
+	}
+
+	// Handle case where no messages were available (redis.Nil was converted to nil result)
+	if result == nil {
+		return nil
 	}
 
 	// Parse BRPOP result
